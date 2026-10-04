@@ -1,0 +1,7 @@
+# Install the CUDA build of PyTorch first:
+#   pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu128
+numpy
+pandas
+soundfile
+tqdm
+tensorboard
