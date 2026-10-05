@@ -92,6 +92,7 @@ def main():
     if not torch.cuda.is_available():
         raise SystemExit("CUDA not available - install the CUDA build of PyTorch first.")
     device = torch.device("cuda")
+    torch.backends.cudnn.benchmark = True
     print(f"Using {torch.cuda.get_device_name(0)}")
 
     download_esc50()
@@ -145,13 +146,15 @@ def main():
             target = target.to(device)
 
             optimizer.zero_grad()
-            if np.random.random() > 0.7:
-                data, target_a, target_b, lam = mixup_data(data, target)
-                output = model(data)
-                loss = mixup_criterion(criterion, output, target_a, target_b, lam)
-            else:
-                output = model(data)
-                loss = criterion(output, target)
+            # bfloat16 mixed precision: roughly halves activation memory on a 6 GB GPU
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                if np.random.random() > 0.7:
+                    data, target_a, target_b, lam = mixup_data(data, target)
+                    output = model(data)
+                    loss = mixup_criterion(criterion, output, target_a, target_b, lam)
+                else:
+                    output = model(data)
+                    loss = criterion(output, target)
             loss.backward()
             optimizer.step()
             scheduler.step()
@@ -170,8 +173,9 @@ def main():
             for waveforms, sr, target in test_loader:
                 data = to_spectrogram(waveforms, sr, train=False)
                 target = target.to(device)
-                outputs = model(data)
-                val_loss += criterion(outputs, target).item()
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    outputs = model(data)
+                    val_loss += criterion(outputs, target).item()
                 correct += (outputs.argmax(1) == target).sum().item()
                 total += target.size(0)
 
