@@ -1,204 +1,243 @@
-import argparse
-import urllib.request
-from datetime import datetime
-import zipfile
 from pathlib import Path
-
-import numpy as np
+import sys
+import urllib.request
+import zipfile
 import pandas as pd
-import soundfile as sf
+import numpy as np
+
+import soundfile as sf  # LOCAL CHANGE: used instead of torchaudio.load (needs TorchCodec + FFmpeg on Windows)
 import torch
+from torch.utils.data import Dataset, DataLoader
+import torchaudio
 import torch.nn as nn
 import torchaudio.transforms as T
-from torch.utils.data import DataLoader, Dataset
-from torch.utils.tensorboard import SummaryWriter
+import torch.optim as optim
+from torch.optim.lr_scheduler import OneCycleLR
 from tqdm import tqdm
+from torch.utils.tensorboard import SummaryWriter
 
 from model import AudioCNN
 
-ROOT = Path(__file__).parent
-DATA_DIR = ROOT / "data"
-ESC50_DIR = DATA_DIR / "ESC-50-master"
-MODEL_DIR = ROOT / "models"
-ESC50_URL = "https://github.com/karoldvl/ESC-50/archive/master.zip"
-
-SAMPLE_RATE = 22050
+# LOCAL CHANGE: instead of the Modal image + volumes, ESC-50 is downloaded into ./data
+# and the model is saved into ./models
+DATA_DIR = Path("data")
+MODEL_DIR = Path("models")
 
 
 def download_esc50():
-    if (ESC50_DIR / "meta" / "esc50.csv").exists():
+    # Same steps as the Modal image's wget + unzip commands
+    if (DATA_DIR / "ESC-50-master").exists():
         return
     DATA_DIR.mkdir(exist_ok=True)
     zip_path = DATA_DIR / "esc50.zip"
-    if not zip_path.exists():
-        print("Downloading ESC-50 (~600 MB)...")
-        with tqdm(unit="B", unit_scale=True) as bar:
-            def hook(blocks, block_size, total):
-                bar.total = total
-                bar.update(blocks * block_size - bar.n)
-            urllib.request.urlretrieve(ESC50_URL, zip_path, reporthook=hook)
-    print("Extracting...")
+    print("Downloading ESC-50...")
+    urllib.request.urlretrieve(
+        "https://github.com/karolpiczak/ESC-50/archive/master.zip", zip_path)
     with zipfile.ZipFile(zip_path) as zf:
         zf.extractall(DATA_DIR)
     zip_path.unlink()
 
 
 class ESC50Dataset(Dataset):
-    """Returns raw mono waveforms; spectrograms are computed on the GPU in batches."""
+    def __init__(self, data_dir, metadata_file, split="train", transform=None):
+        super().__init__()
+        self.data_dir = Path(data_dir)
+        self.metadata = pd.read_csv(metadata_file)
+        self.split = split
+        self.transform = transform
 
-    def __init__(self, data_dir, metadata_file, split="train"):
-        df = pd.read_csv(metadata_file)
-        # Fold 5 is held out for testing, as in the video
-        self.df = df[df["fold"] != 5] if split == "train" else df[df["fold"] == 5]
-        self.df = self.df.reset_index(drop=True)
-        self.audio_dir = Path(data_dir) / "audio"
-        self.classes = sorted(df["category"].unique())
-        self.class_to_idx = {c: i for i, c in enumerate(self.classes)}
+        if split == 'train':
+            self.metadata = self.metadata[self.metadata['fold'] != 5]
+        else:
+            self.metadata = self.metadata[self.metadata['fold'] == 5]
+
+        self.classes = sorted(self.metadata['category'].unique())
+        self.class_to_idx = {cls: idx for idx, cls in enumerate(self.classes)}
+        self.metadata['label'] = self.metadata['category'].map(
+            self.class_to_idx)
 
     def __len__(self):
-        return len(self.df)
+        return len(self.metadata)
 
     def __getitem__(self, idx):
-        row = self.df.iloc[idx]
-        waveform, sr = sf.read(self.audio_dir / row["filename"], dtype="float32")
-        if waveform.ndim > 1:
-            waveform = waveform.mean(axis=1)
-        return torch.from_numpy(waveform), sr, self.class_to_idx[row["category"]]
+        row = self.metadata.iloc[idx]
+        audio_path = self.data_dir / "audio" / row['filename']
 
+        # LOCAL CHANGE: soundfile instead of torchaudio.load. Transposed so the
+        # shape is (channels, samples), exactly what torchaudio.load returns.
+        audio, sample_rate = sf.read(audio_path, dtype="float32", always_2d=True)
+        waveform = torch.from_numpy(audio.T)
 
-def collate(batch):
-    waveforms, srs, labels = zip(*batch)
-    return torch.stack(waveforms), srs[0], torch.tensor(labels)
+        if waveform.shape[0] > 1:
+            waveform = torch.mean(waveform, dim=0, keepdim=True)
+
+        if self.transform:
+            spectrogram = self.transform(waveform)
+        else:
+            spectrogram = waveform
+
+        return spectrogram, row['label']
 
 
 def mixup_data(x, y):
     lam = np.random.beta(0.2, 0.2)
-    index = torch.randperm(x.size(0), device=x.device)
-    mixed_x = lam * x + (1 - lam) * x[index]
-    return mixed_x, y, y[index], lam
+
+    batch_size = x.size(0)
+    index = torch.randperm(batch_size).to(x.device)
+
+    mixed_x = lam * x + (1 - lam) * x[index, :]
+    y_a, y_b = y, y[index]
+    return mixed_x, y_a, y_b, lam
 
 
 def mixup_criterion(criterion, pred, y_a, y_b, lam):
     return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--num-workers", type=int, default=2)
-    args = parser.parse_args()
-
-    if not torch.cuda.is_available():
-        raise SystemExit("CUDA not available - install the CUDA build of PyTorch first.")
-    device = torch.device("cuda")
-    torch.backends.cudnn.benchmark = True
-    print(f"Using {torch.cuda.get_device_name(0)}")
+def train():
+    from datetime import datetime
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_dir = f'{MODEL_DIR}/tensorboard_logs/run_{timestamp}'
+    writer = SummaryWriter(log_dir)
 
     download_esc50()
-    MODEL_DIR.mkdir(exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    writer = SummaryWriter(MODEL_DIR / "tensorboard_logs" / f"run_{timestamp}")
+    esc50_dir = DATA_DIR / "ESC-50-master"
 
-    to_mel = nn.Sequential(
-        T.MelSpectrogram(sample_rate=SAMPLE_RATE, n_fft=1024, hop_length=512,
-                         n_mels=128, f_min=0, f_max=11025),
+    train_transform = nn.Sequential(
+        T.MelSpectrogram(
+            sample_rate=22050,
+            n_fft=1024,
+            hop_length=512,
+            n_mels=128,
+            f_min=0,
+            f_max=11025
+        ),
         T.AmplitudeToDB(),
-    ).to(device)
-    spec_augment = nn.Sequential(
         T.FrequencyMasking(freq_mask_param=30),
-        T.TimeMasking(time_mask_param=80),
-    ).to(device)
+        T.TimeMasking(time_mask_param=80)
+    )
 
-    def to_spectrogram(waveforms, sr, train):
-        # Like the original repo, the 44.1 kHz audio is not resampled before the
-        # 22050 Hz mel transform, so spectrograms match the repo's inference code.
-        waveforms = waveforms.to(device, non_blocking=True)
-        spec = to_mel(waveforms).unsqueeze(1)  # (B, 1, n_mels, time)
-        return spec_augment(spec) if train else spec
+    val_transform = nn.Sequential(
+        T.MelSpectrogram(
+            sample_rate=22050,
+            n_fft=1024,
+            hop_length=512,
+            n_mels=128,
+            f_min=0,
+            f_max=11025
+        ),
+        T.AmplitudeToDB()
+    )
 
-    meta = ESC50_DIR / "meta" / "esc50.csv"
-    train_ds = ESC50Dataset(ESC50_DIR, meta, split="train")
-    test_ds = ESC50Dataset(ESC50_DIR, meta, split="test")
-    print(f"Training samples: {len(train_ds)}, Val samples: {len(test_ds)}")
+    train_dataset = ESC50Dataset(
+        data_dir=esc50_dir, metadata_file=esc50_dir / "meta" / "esc50.csv", split="train", transform=train_transform)
 
-    loader_kwargs = dict(batch_size=args.batch_size, collate_fn=collate,
-                         num_workers=args.num_workers, pin_memory=True,
-                         persistent_workers=args.num_workers > 0)
-    train_loader = DataLoader(train_ds, shuffle=True, **loader_kwargs)
-    test_loader = DataLoader(test_ds, shuffle=False, **loader_kwargs)
+    val_dataset = ESC50Dataset(
+        data_dir=esc50_dir, metadata_file=esc50_dir / "meta" / "esc50.csv", split="test", transform=val_transform)
 
-    model = AudioCNN(num_classes=len(train_ds.classes)).to(device)
+    print(f"Training samples: {len(train_dataset)}")
+    print(f"Val samples: {len(val_dataset)}")
+
+    train_dataloader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+    test_dataloader = DataLoader(val_dataset, batch_size=32, shuffle=False)
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = AudioCNN(num_classes=len(train_dataset.classes))
+    model.to(device)
+
+    num_epochs = 100
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.0005, weight_decay=0.01)
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer, max_lr=0.002, epochs=args.epochs,
-        steps_per_epoch=len(train_loader), pct_start=0.1)
+    optimizer = optim.AdamW(model.parameters(), lr=0.0005, weight_decay=0.01)
+
+    scheduler = OneCycleLR(
+        optimizer,
+        max_lr=0.002,
+        epochs=num_epochs,
+        steps_per_epoch=len(train_dataloader),
+        pct_start=0.1
+    )
 
     best_accuracy = 0.0
+
     print("Starting training")
-    for epoch in range(args.epochs):
+    for epoch in range(num_epochs):
         model.train()
         epoch_loss = 0.0
-        progress = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{args.epochs}", leave=False)
-        for waveforms, sr, target in progress:
-            data = to_spectrogram(waveforms, sr, train=True)
-            target = target.to(device)
 
-            optimizer.zero_grad()
-            # bfloat16 mixed precision: roughly halves activation memory on a 6 GB GPU
-            with torch.autocast("cuda", dtype=torch.bfloat16):
+        progress_bar = tqdm(
+            train_dataloader, desc=f'Epoch {epoch+1}/{num_epochs}')
+        for data, target in progress_bar:
+            data, target = data.to(device), target.to(device)
+
+            # LOCAL CHANGE: mixed precision (bfloat16) so the model fits in a 6 GB GPU.
+            # Without it, memory spills into system RAM and training is ~13x slower.
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
                 if np.random.random() > 0.7:
                     data, target_a, target_b, lam = mixup_data(data, target)
                     output = model(data)
-                    loss = mixup_criterion(criterion, output, target_a, target_b, lam)
+                    loss = mixup_criterion(
+                        criterion, output, target_a, target_b, lam)
                 else:
                     output = model(data)
                     loss = criterion(output, target)
+
+            optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             scheduler.step()
 
             epoch_loss += loss.item()
-            progress.set_postfix(loss=f"{loss.item():.4f}")
+            progress_bar.set_postfix({'Loss': f'{loss.item():.4f}'})
 
-        avg_epoch_loss = epoch_loss / len(train_loader)
-        writer.add_scalar("Loss/Train", avg_epoch_loss, epoch)
-        writer.add_scalar("Learning_Rate", optimizer.param_groups[0]["lr"], epoch)
+        avg_epoch_loss = epoch_loss / len(train_dataloader)
+        writer.add_scalar('Loss/Train', avg_epoch_loss, epoch)
+        writer.add_scalar(
+            'Learning_Rate', optimizer.param_groups[0]['lr'], epoch)
 
+        # Validation after each epoch
         model.eval()
-        correct = total = 0
-        val_loss = 0.0
+
+        correct = 0
+        total = 0
+        val_loss = 0
+
         with torch.no_grad():
-            for waveforms, sr, target in test_loader:
-                data = to_spectrogram(waveforms, sr, train=False)
-                target = target.to(device)
-                with torch.autocast("cuda", dtype=torch.bfloat16):
+            for data, target in test_dataloader:
+                data, target = data.to(device), target.to(device)
+                # LOCAL CHANGE: mixed precision, same as in training
+                with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
                     outputs = model(data)
-                    val_loss += criterion(outputs, target).item()
-                correct += (outputs.argmax(1) == target).sum().item()
+                    loss = criterion(outputs, target)
+                val_loss += loss.item()
+
+                _, predicted = torch.max(outputs.data, 1)
                 total += target.size(0)
+                correct += (predicted == target).sum().item()
 
         accuracy = 100 * correct / total
-        avg_val_loss = val_loss / len(test_loader)
-        writer.add_scalar("Loss/Validation", avg_val_loss, epoch)
-        writer.add_scalar("Accuracy/Validation", accuracy, epoch)
-        print(f"Epoch {epoch + 1}: train loss {avg_epoch_loss:.4f}, "
-              f"val loss {avg_val_loss:.4f}, accuracy {accuracy:.2f}%")
+        avg_val_loss = val_loss / len(test_dataloader)
+
+        writer.add_scalar('Loss/Validation', avg_val_loss, epoch)
+        writer.add_scalar('Accuracy/Validation', accuracy, epoch)
+
+        print(
+            f'Epoch {epoch+1} Loss: {avg_epoch_loss:.4f}, Val Loss: {avg_val_loss:.4f}, Accuracy: {accuracy:.2f}%')
 
         if accuracy > best_accuracy:
             best_accuracy = accuracy
+            MODEL_DIR.mkdir(exist_ok=True)
             torch.save({
-                "model_state_dict": model.state_dict(),
-                "accuracy": accuracy,
-                "epoch": epoch,
-                "classes": train_ds.classes,
-            }, MODEL_DIR / "best_model.pth")
-            print(f"New best model saved: {accuracy:.2f}%")
+                'model_state_dict': model.state_dict(),
+                'accuracy': accuracy,
+                'epoch': epoch,
+                'classes': train_dataset.classes
+            }, f'{MODEL_DIR}/best_model.pth')
+            print(f'New best model saved: {accuracy:.2f}%')
 
     writer.close()
-    print(f"Training completed! Best accuracy: {best_accuracy:.2f}%")
+    print(f'Training completed! Best accuracy: {best_accuracy:.2f}%')
 
 
+# LOCAL CHANGE: replaces @app.local_entrypoint() + train.remote()
 if __name__ == "__main__":
-    main()
+    train()
